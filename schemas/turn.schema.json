@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "answer", "open_questions"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["converged", "needs_input", "blocked"],
+      "description": "converged: the question is fully answered and no further turn is needed. needs_input: you need a decision or information from the caller before continuing. blocked: you cannot proceed (missing access, contradictory requirements, out of scope)."
+    },
+    "answer": {
+      "type": "string",
+      "description": "The full answer for this turn, as prose or markdown. Do not compress it into bullet points for the sake of the schema; write what you would have written anyway."
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Specific questions the caller must answer for you to continue. Empty when status is converged."
+    }
+  }
+}

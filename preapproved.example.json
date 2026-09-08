@@ -1,0 +1,24 @@
+{
+  "roots": [
+    "~/notes",
+    "~/src"
+  ],
+  "bash": [
+    "ls",
+    "wc",
+    "cat",
+    "head",
+    "grep"
+  ],
+  "bash_anywhere": [
+    "echo"
+  ],
+  "version_probes": [
+    "cargo",
+    "rustc",
+    "python3",
+    "node",
+    "go",
+    "git"
+  ]
+}
