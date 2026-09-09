@@ -1,0 +1,116 @@
+# Tooling only. Nothing here is needed to *run* the driver: `python3 ask_opencode.py` works
+# from a clone with an unmodified CPython. This file exists so the lint, type and test
+# gate has one place to configure, and `[tool.uv] package = false` keeps `uv` from trying
+# to build or install anything.
+
+[project]
+name = "ask-opencode"
+version = "0.1.0"
+description = "Multi-turn conversations with the opencode coding agent, one turn per call"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1.400,<2",
+  "pytest>=8.3,<10",
+  "pytest-timeout>=2.3,<3",
+  "pytest-xdist>=3.6,<4",
+  "ruff>=0.9,<1",
+]
+
+[tool.pytest.ini_options]
+# Flags live here rather than in the justfile so a bare `uv run pytest` and the gate
+# cannot drift apart.
+#
+# The timeout is a hang ceiling, not a performance budget. This suite drives a loopback
+# HTTP server, an event stream held open for the length of a turn, and driver
+# subprocesses; a case that wedges on any of them stops the run with no output at all,
+# which reads exactly like slowness. Naming the case is the difference between a quick
+# diagnosis and an afternoon.
+# Measured on this suite: 68s in one process, 20s across four workers and 12s across
+# eight. Almost every case waits on a socket rather than on a CPU, so it keeps improving
+# slightly past the core count; `auto` follows whatever machine it runs on instead of
+# pinning a number that only suits one. `worksteal` rather than fixed batches, because a
+# handful of cases wait out a deadline on purpose while most finish in milliseconds.
+addopts = "-ra --strict-config --strict-markers -n auto --dist worksteal --timeout=120"
+testpaths = ["tests"]
+# Tests import the driver by name from the repository root, and the fake server by name
+# from `tests/`.
+pythonpath = [".", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "W",
+  "F",
+  "I",
+  "N",
+  "UP",
+  "B",
+  "A",
+  "C4",
+  "DTZ",
+  "T10",
+  "LOG",
+  "G",
+  "PIE",
+  "PT",
+  "RSE",
+  "RET",
+  "SIM",
+  "ARG",
+  "ASYNC",
+  "PERF",
+  "FURB",
+  "RUF",
+]
+# The formatter owns line length. E501 would only duplicate it, and disagree about the
+# strings and comments it cannot split.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# The driver and the fake are imported by bare name from the repository root and from
+# `tests/`; without this they sort as third-party and the import block never settles.
+known-first-party = ["ask_opencode", "policy", "fake_opencode"]
+
+[tool.ruff.lint.per-file-ignores]
+# flake8-pytest-style is about how a failing test reads. A production invariant assert is
+# not a test and gains nothing from being rewritten as one.
+"ask_opencode.py" = ["PT"]
+"policy.py" = ["PT"]
+# Fakes and stubs must match signatures they do not use.
+"tests/**" = ["ARG001", "ARG002", "ARG005"]
+
+[tool.pyright]
+# The editor-facing configuration: `standard` over the whole tree. The suite holds
+# JSON-shaped `dict[str, object]` and reaches for internals by name on purpose, and
+# `strict` turns both habits into errors that say nothing about the driver. Strictness is
+# applied separately, by the two configs under `config/pyright/` and by the justfile.
+#
+# Three runs rather than one because `executionEnvironments` has no `typeCheckingMode`:
+# writing one there prints "unrecognized setting" and still exits 0, so the strictness
+# would be lost with nothing going red. Rule-by-rule exemptions cannot reproduce a mode
+# either, because the modes differ in inference and not only in which rules are on.
+include = ["ask_opencode.py", "policy.py", "tests"]
+exclude = ["**/__pycache__", ".venv"]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+# pyright honours a bare `# type: ignore` and does not read the rule codes in brackets, so
+# one of them silences every diagnostic on its line. With them off, `# pyright: ignore[rule]`
+# is the only way to suppress anything: it names what it silences, and goes red when that
+# rule stops firing.
+enableTypeIgnoreComments = false
+reportMissingImports = "error"
+reportMissingTypeStubs = "warning"

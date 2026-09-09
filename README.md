@@ -154,11 +154,11 @@ MIT — see `LICENSE`.
 ## Tests
 
 ```console
-$ cd tests && python3 -m unittest test_ask_opencode
+$ just check
 ```
 
-218 tests, standard library only. A fake server stands in for the real one, so the suite makes no
-model calls and costs nothing.
+Format, lint, three type-check configurations and 218 tests. A fake server stands in for the real
+one, so the suite makes no model calls and costs nothing. `just test` runs the suite alone.
 
 The design notes that matter — how opencode resolves a permission ruleset, what a turn looks like on
 the wire, and which behaviours were measured rather than assumed — live in the module docstrings of

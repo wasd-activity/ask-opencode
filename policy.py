@@ -73,6 +73,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 # Tool calls that cannot be undone by the caller once they run. These are the
 # only gate that does not depend on the calling session's judgement, so they are
@@ -233,7 +234,7 @@ def _string_list(source: Path, loaded: dict[str, object], key: str) -> tuple[str
     if not isinstance(raw, list):
         raise PreapprovedError(f"{source}: '{key}' must be a list of strings")
     items: list[str] = []
-    for entry in raw:
+    for entry in cast("list[object]", raw):
         if not isinstance(entry, str) or not entry.strip():
             raise PreapprovedError(f"{source}: '{key}' must hold non-empty strings")
         text = entry.strip()
@@ -255,33 +256,29 @@ def load_preapproved(path: Path | None = None) -> Preapproved | None:
     falling back to a ruleset the caller did not ask for — in either direction —
     would be exactly the kind of silent change this module exists to prevent.
     """
-    target = path or Path(
-        os.environ.get("ASK_OPENCODE_PREAPPROVED", DEFAULT_PREAPPROVED_PATH)
-    ).expanduser()
+    target = (
+        path
+        or Path(os.environ.get("ASK_OPENCODE_PREAPPROVED", DEFAULT_PREAPPROVED_PATH)).expanduser()
+    )
     if not target.exists():
         return None
     try:
-        loaded = json.loads(target.read_text())
+        decoded = json.loads(target.read_text())
     except (OSError, ValueError) as exc:
-        raise PreapprovedError(f"{target}: {exc}")
-    if not isinstance(loaded, dict):
+        raise PreapprovedError(f"{target}: {exc}") from exc
+    if not isinstance(decoded, dict):
         raise PreapprovedError(f"{target}: the top level must be an object")
+    # A JSON object's keys are strings by construction, which is what the cast asserts;
+    # `isinstance` alone narrows the value to a mapping whose contents stay untyped.
+    loaded = cast("dict[str, object]", decoded)
     known = {"roots", "bash", "bash_anywhere", "version_probes"}
     unknown = sorted(set(loaded) - known)
     if unknown:
         raise PreapprovedError(f"{target}: unknown key(s) {unknown}")
     roots = _string_list(target, loaded, "roots") if "roots" in loaded else ()
     commands = _string_list(target, loaded, "bash") if "bash" in loaded else ()
-    anywhere = (
-        _string_list(target, loaded, "bash_anywhere")
-        if "bash_anywhere" in loaded
-        else ()
-    )
-    probes = (
-        _string_list(target, loaded, "version_probes")
-        if "version_probes" in loaded
-        else ()
-    )
+    anywhere = _string_list(target, loaded, "bash_anywhere") if "bash_anywhere" in loaded else ()
+    probes = _string_list(target, loaded, "version_probes") if "version_probes" in loaded else ()
     for key, entries in (("bash", commands), ("bash_anywhere", anywhere)):
         for entry in entries:
             head = entry.split()[0]
@@ -375,8 +372,7 @@ def unsafe_guards(prefixes: tuple[str, ...]) -> tuple[str, ...]:
         if head not in heads:
             heads.append(head)
     for head in heads:
-        for form in SUBSTITUTION_FORMS:
-            patterns.append(f"{head} *{form}*")
+        patterns.extend(f"{head} *{form}*" for form in SUBSTITUTION_FORMS)
         for flag in REVIEWED_HEADS.get(head, ()):
             if flag.startswith("--"):
                 patterns.append(f"{head} *{flag}*")

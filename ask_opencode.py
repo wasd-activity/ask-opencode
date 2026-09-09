@@ -39,8 +39,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import policy
 
@@ -58,9 +59,7 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw is not None else default
 
 
-STATE_DIR = _env_path(
-    "ASK_OPENCODE_STATE_DIR", Path.home() / ".claude/state/ask-opencode"
-)
+STATE_DIR = _env_path("ASK_OPENCODE_STATE_DIR", Path.home() / ".claude/state/ask-opencode")
 
 # Monitor's per-notification budget truncates well above this; staying under it
 # means an inlined body is never cut in half.
@@ -132,12 +131,12 @@ class UsageError(Exception):
     """Bad input or environment; reported to the caller as exit 4."""
 
 
-class ServerDown(Exception):
+class ServerDownError(Exception):
     """The opencode server did not answer at all."""
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def slugify(text: str, limit: int = 24) -> str:
@@ -184,18 +183,78 @@ def turn_file(conv: str, n: int, ext: str) -> Path:
     return turns_dir(conv) / f"{n}.{ext}"
 
 
+def json_object(raw: str) -> dict[str, object] | None:
+    """Narrow one JSON document, once.
+
+    Decoded JSON has no static type. This is the single place that turns it into
+    something typed: a JSON object's keys are strings by construction, which is what the
+    cast asserts, and anything that is not an object is refused.
+    """
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return cast("dict[str, object]", loaded)
+
+
+def as_dict(value: object) -> dict[str, object]:
+    """A JSON object, or an empty one.
+
+    The cast asserts what JSON guarantees — keys are strings — because narrowing `object`
+    with `isinstance` alone leaves the contents untyped.
+    """
+    return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+
+def as_object(value: object) -> dict[str, object] | None:
+    """A JSON object, or None when the value is anything else.
+
+    The variant to reach for where "absent" and "empty object" must stay apart.
+    """
+    return cast("dict[str, object]", value) if isinstance(value, dict) else None
+
+
+def as_list(value: object) -> list[object]:
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def as_dicts(value: object) -> list[dict[str, object]]:
+    """Every element of a JSON array that is itself an object."""
+    return [cast("dict[str, object]", item) for item in as_list(value) if isinstance(item, dict)]
+
+
+def as_str(value: object, default: str = "") -> str:
+    return value if isinstance(value, str) else default
+
+
+def as_int(value: object, default: int = 0) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def as_float(value: object, default: float = 0.0) -> float:
+    return (
+        float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+    )
+
+
 def meta_path(conv: str) -> Path:
     return conv_dir(conv) / "meta.json"
 
 
-def load_meta(conv: str) -> dict:
+def load_meta(conv: str) -> dict[str, object]:
     try:
-        return json.loads(meta_path(conv).read_text())
-    except (OSError, ValueError):
+        text = meta_path(conv).read_text()
+    except OSError as err:
+        raise UsageError(f"no such conversation: {conv}") from err
+    loaded = json_object(text)
+    if loaded is None:
         raise UsageError(f"no such conversation: {conv}")
+    return loaded
 
 
-def save_meta(conv: str, meta: dict) -> None:
+def save_meta(conv: str, meta: dict[str, object]) -> None:
     conv_dir(conv).mkdir(parents=True, exist_ok=True)
     meta_path(conv).write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
 
@@ -218,7 +277,7 @@ def api(
     method: str,
     path: str,
     *,
-    params: dict | None = None,
+    params: dict[str, object] | None = None,
     body: object = None,
     timeout: float = HTTP_TIMEOUT_S,
 ) -> object:
@@ -237,15 +296,15 @@ def api(
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
-        raise UsageError(f"{method} {path} -> HTTP {exc.code}: {detail}")
+        raise UsageError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise ServerDown(f"{method} {path}: {exc}")
+        raise ServerDownError(f"{method} {path}: {exc}") from exc
     if not raw.strip():
         return None
     try:
         return json.loads(raw)
-    except ValueError:
-        raise UsageError(f"{method} {path} returned a non-JSON body")
+    except ValueError as err:
+        raise UsageError(f"{method} {path} returned a non-JSON body") from err
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +316,7 @@ def probe_server(timeout: float = 2.0) -> str:
     'foreign' (something else is on the port)."""
     try:
         payload = api("GET", "/session/status", timeout=timeout)
-    except ServerDown:
+    except ServerDownError:
         return "down"
     except UsageError:
         return "foreign"
@@ -272,9 +331,7 @@ def resolve_binary() -> str:
 
     found = which("opencode")
     if not found:
-        raise UsageError(
-            "opencode CLI not found on PATH (set ASK_OPENCODE_BIN to override)."
-        )
+        raise UsageError("opencode CLI not found on PATH (set ASK_OPENCODE_BIN to override).")
     return found
 
 
@@ -387,8 +444,8 @@ def signal_server(pid: int, timeout: float) -> str:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return "already gone"
-    except PermissionError:
-        raise UsageError(f"pid {pid} is not signalable by this user.")
+    except PermissionError as err:
+        raise UsageError(f"pid {pid} is not signalable by this user.") from err
     if await_exit(pid, timeout):
         return "SIGTERM"
     try:
@@ -400,27 +457,28 @@ def signal_server(pid: int, timeout: float) -> str:
     raise UsageError(f"pid {pid} survived SIGKILL; stop it by hand.")
 
 
-def conversations_on(port: int) -> list[dict]:
+def conversations_on(port: int) -> list[dict[str, object]]:
     """Every conversation this machine has recorded against `port`.
 
     The state directory is shared, so this sees the conversations of other
     sessions too. It cannot see a TUI or any other client attached to the same
     server — that is the limit of what `stop` can check.
     """
-    found: list[dict] = []
+    found: list[dict[str, object]] = []
     if not STATE_DIR.exists():
         return found
     for path in sorted(STATE_DIR.glob("*/meta.json")):
         try:
-            meta = json.loads(path.read_text())
-        except (OSError, ValueError):
+            text = path.read_text()
+        except OSError:
             continue
-        if isinstance(meta, dict) and meta.get("port") == port:
+        meta = json_object(text)
+        if meta is not None and meta.get("port") == port:
             found.append(meta)
     return found
 
 
-def in_flight(metas: list[dict]) -> list[str]:
+def in_flight(metas: list[dict[str, object]]) -> list[str]:
     """The conversations holding a turn open, newest state as recorded."""
     return [
         str(meta.get("conv"))
@@ -429,16 +487,11 @@ def in_flight(metas: list[dict]) -> list[str]:
     ]
 
 
-def idle_seconds(metas: list[dict]) -> float | None:
+def idle_seconds(metas: list[dict[str, object]]) -> float | None:
     """Seconds since the last turn on this port ended, or None if never used."""
     newest: float | None = None
     for meta in metas:
-        turns = meta.get("turns")
-        if not isinstance(turns, list):
-            continue
-        for turn in turns:
-            if not isinstance(turn, dict):
-                continue
+        for turn in as_dicts(meta.get("turns")):
             started = turn.get("started_at")
             if not isinstance(started, str):
                 continue
@@ -446,8 +499,7 @@ def idle_seconds(metas: list[dict]) -> float | None:
                 stamp = datetime.fromisoformat(started).timestamp()
             except ValueError:
                 continue
-            duration = turn.get("duration_s")
-            ended = stamp + (float(duration) if isinstance(duration, (int, float)) else 0.0)
+            ended = stamp + as_float(turn.get("duration_s"))
             newest = ended if newest is None else max(newest, ended)
     return None if newest is None else time.time() - newest
 
@@ -460,7 +512,7 @@ def idle_seconds(metas: list[dict]) -> float | None:
 # split the conversation.
 
 
-def parse_model(spec: str | None) -> dict | None:
+def parse_model(spec: str | None) -> dict[str, object] | None:
     """provider/model as the *session* endpoint wants it.
 
     The two endpoints genuinely differ, and the asymmetry below is not a slip:
@@ -480,20 +532,23 @@ def recent_model() -> str | None:
     """The model opencode's TUI last used, which is what answers when neither
     --model nor the config names one."""
     try:
-        loaded = json.loads(MODEL_STATE.read_text())
-    except (OSError, ValueError):
+        text = MODEL_STATE.read_text()
+    except OSError:
         return None
-    recent = loaded.get("recent") if isinstance(loaded, dict) else None
-    entry = recent[0] if isinstance(recent, list) and recent else None
-    if not isinstance(entry, dict):
+    loaded = json_object(text)
+    if loaded is None:
         return None
+    recent = as_list(loaded.get("recent"))
+    if not recent:
+        return None
+    entry = as_dict(recent[0])
     provider, model = entry.get("providerID"), entry.get("modelID")
     if isinstance(provider, str) and isinstance(model, str):
         return f"{provider}/{model}"
     return None
 
 
-def resolve_model(meta: dict) -> tuple[str | None, str]:
+def resolve_model(meta: dict[str, object]) -> tuple[str | None, str]:
     """The model this session will actually use, and where it comes from.
 
     Three sources, in the order opencode consults them. The config is read from
@@ -505,9 +560,9 @@ def resolve_model(meta: dict) -> tuple[str | None, str]:
         return spec, "--model"
     try:
         config = api("GET", "/config", params={"directory": meta["repo"]})
-    except (UsageError, ServerDown):
+    except (UsageError, ServerDownError):
         config = None
-    configured = config.get("model") if isinstance(config, dict) else None
+    configured = as_dict(config).get("model")
     if isinstance(configured, str) and configured:
         return configured, "the opencode config for this directory"
     fallback = recent_model()
@@ -525,43 +580,40 @@ def providers_payload() -> object | None:
     """
     try:
         return api("GET", "/config/providers")
-    except (UsageError, ServerDown):
+    except (UsageError, ServerDownError):
         return None
 
 
 def available_models(payload: object) -> set[str] | None:
     """Every provider/model this server can reach, or None if it will not say."""
-    providers = payload.get("providers") if isinstance(payload, dict) else None
-    if not isinstance(providers, list):
+    providers = as_list(as_dict(payload).get("providers"))
+    if not providers:
         return None
     known: set[str] = set()
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
+    for entry in providers:
+        provider = as_dict(entry)
         provider_id = provider.get("id")
-        models = provider.get("models")
-        if not isinstance(provider_id, str) or not isinstance(models, dict):
+        models = as_dict(provider.get("models"))
+        if not isinstance(provider_id, str):
             continue
-        known |= {f"{provider_id}/{m}" for m in models if isinstance(m, str)}
+        known |= {f"{provider_id}/{m}" for m in models}
     return known or None
 
 
 def available_variants(payload: object, spec: str) -> set[str] | None:
     """The variants the server lists for provider/model, or None if it will not
     say — which includes a model whose entry simply has no variants."""
-    providers = payload.get("providers") if isinstance(payload, dict) else None
-    if not isinstance(providers, list):
+    providers = as_list(as_dict(payload).get("providers"))
+    if not providers:
         return None
     provider_id, _, model_id = spec.partition("/")
-    for provider in providers:
-        if not isinstance(provider, dict) or provider.get("id") != provider_id:
+    for entry in providers:
+        provider = as_dict(entry)
+        if provider.get("id") != provider_id:
             continue
-        models = provider.get("models")
-        model = models.get(model_id) if isinstance(models, dict) else None
-        variants = model.get("variants") if isinstance(model, dict) else None
-        if isinstance(variants, dict):
-            return {v for v in variants if isinstance(v, str)}
-        return None
+        model = as_dict(as_dict(provider.get("models")).get(model_id))
+        variants = as_object(model.get("variants"))
+        return None if variants is None else set(variants)
     return None
 
 
@@ -571,32 +623,21 @@ def model_inventory(payload: object) -> list[tuple[str, tuple[str, ...]]]:
     Only the identifiers are read. The providers document also carries provider
     configuration, which is not this function's business and never leaves it.
     """
-    providers = payload.get("providers") if isinstance(payload, dict) else None
-    if not isinstance(providers, list):
-        return []
     found: list[tuple[str, tuple[str, ...]]] = []
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
+    for entry in as_list(as_dict(payload).get("providers")):
+        provider = as_dict(entry)
         provider_id = provider.get("id")
-        models = provider.get("models")
-        if not isinstance(provider_id, str) or not isinstance(models, dict):
+        models = as_dict(provider.get("models"))
+        if not isinstance(provider_id, str):
             continue
         for model_id in sorted(models):
-            if not isinstance(model_id, str):
-                continue
-            entry = models[model_id]
-            variants = entry.get("variants") if isinstance(entry, dict) else None
-            names = (
-                tuple(sorted(v for v in variants if isinstance(v, str)))
-                if isinstance(variants, dict)
-                else ()
-            )
+            variants = as_object(as_dict(models[model_id]).get("variants"))
+            names = () if variants is None else tuple(sorted(variants))
             found.append((f"{provider_id}/{model_id}", names))
     return found
 
 
-def check_model(meta: dict) -> None:
+def check_model(meta: dict[str, object]) -> None:
     """Refuse a model this server does not have, before a turn is spent on it.
 
     Such a prompt is accepted with 204 and then silently never answered, so
@@ -632,7 +673,7 @@ def check_model(meta: dict) -> None:
 
 def preapproved_summary(
     preapproved: policy.Preapproved | None, repo: Path, extra_roots: tuple[Path, ...]
-) -> dict | None:
+) -> dict[str, object] | None:
     """What the turn files report about the pre-approval in force."""
     if preapproved is None and not extra_roots:
         return None
@@ -647,16 +688,13 @@ def preapproved_summary(
     }
 
 
-def meta_read_roots(meta: dict) -> tuple[Path, ...]:
+def meta_read_roots(meta: dict[str, object]) -> tuple[Path, ...]:
     """The conversation's `--read-root` paths, as stored on `start`."""
-    stored = meta.get("read_roots")
-    if not isinstance(stored, list):
-        return ()
-    return tuple(Path(str(root)) for root in stored)
+    return tuple(Path(str(root)) for root in as_list(meta.get("read_roots")))
 
 
-def create_session(meta: dict, preapproved: policy.Preapproved | None) -> str:
-    body: dict = {
+def create_session(meta: dict[str, object], preapproved: policy.Preapproved | None) -> str:
+    body: dict[str, object] = {
         "title": f"ask-opencode {meta['conv']}",
         "permission": policy.build(
             bool(meta.get("write")),
@@ -665,15 +703,16 @@ def create_session(meta: dict, preapproved: policy.Preapproved | None) -> str:
             meta_read_roots(meta),
         ),
     }
-    model = parse_model(meta.get("model"))
+    model = parse_model(as_str(meta.get("model")) or None)
     if model:
         body["model"] = model
     if meta.get("agent"):
         body["agent"] = meta["agent"]
     payload = api("POST", "/session", params={"directory": meta["repo"]}, body=body)
-    if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
+    session_id = as_dict(payload).get("id")
+    if not isinstance(session_id, str):
         raise UsageError(f"session create returned no id: {payload!r}")
-    return payload["id"]
+    return session_id
 
 
 def schema_instruction(schema_path: str) -> str:
@@ -689,7 +728,7 @@ def schema_instruction(schema_path: str) -> str:
     try:
         loaded = json.loads(Path(schema_path).read_text())
     except (OSError, ValueError) as exc:
-        raise UsageError(f"could not read --schema {schema_path}: {exc}")
+        raise UsageError(f"could not read --schema {schema_path}: {exc}") from exc
     return (
         "\n\n---\n"
         "Reply with a single fenced ```json block, and nothing after it, that "
@@ -702,11 +741,11 @@ def schema_instruction(schema_path: str) -> str:
     )
 
 
-def post_prompt(meta: dict, mid: str, text: str) -> None:
-    body: dict = {"messageID": mid, "parts": [{"type": "text", "text": text}]}
+def post_prompt(meta: dict[str, object], mid: str, text: str) -> None:
+    body: dict[str, object] = {"messageID": mid, "parts": [{"type": "text", "text": text}]}
     if meta.get("agent"):
         body["agent"] = meta["agent"]
-    model = parse_model(meta.get("model"))
+    model = parse_model(as_str(meta.get("model")) or None)
     if model:
         # `modelID` here, `id` on session create — see parse_model.
         body["model"] = {"providerID": model["providerID"], "modelID": model["id"]}
@@ -720,43 +759,41 @@ def post_prompt(meta: dict, mid: str, text: str) -> None:
     )
 
 
-def fetch_messages(meta: dict) -> list[dict]:
+def fetch_messages(meta: dict[str, object]) -> list[dict[str, object]]:
     payload = api(
         "GET",
         f"/session/{meta['session_id']}/message",
         params={"directory": meta["repo"]},
     )
-    return (
-        [m for m in payload if isinstance(m, dict)] if isinstance(payload, list) else []
-    )
+    return as_dicts(payload)
 
 
-def message_parts(message: dict) -> list[dict]:
-    parts = message.get("parts")
-    return [p for p in parts if isinstance(p, dict)] if isinstance(parts, list) else []
+def message_parts(message: dict[str, object]) -> list[dict[str, object]]:
+    return as_dicts(message.get("parts"))
 
 
-def is_compaction(message: dict) -> bool:
+def is_compaction(message: dict[str, object]) -> bool:
     """A user message the server inserted to compact the session's context."""
-    info = message.get("info")
-    if not isinstance(info, dict) or info.get("role") != "user":
+    if as_dict(message.get("info")).get("role") != "user":
         return False
     return any(part.get("type") == "compaction" for part in message_parts(message))
 
 
-def is_summary(message: dict) -> bool:
+def is_summary(message: dict[str, object]) -> bool:
     """The assistant message a compaction produces, rather than an answer.
 
     Only assistant messages carry `summary` as a flag; on a user message the
     same field holds a diff record, which is why the role is checked first.
     """
-    info = message.get("info")
-    if not isinstance(info, dict) or info.get("role") != "assistant":
+    info = as_dict(message.get("info"))
+    if info.get("role") != "assistant":
         return False
     return bool(info.get("summary"))
 
 
-def after_prompt(messages: list[dict], mid: str, own: set[str]) -> list[dict] | None:
+def after_prompt(
+    messages: list[dict[str, object]], mid: str, own: set[str]
+) -> list[dict[str, object]] | None:
     """The messages belonging to the turn `mid` opened, or None if it is absent.
 
     Bounded by the next prompt this tool sent, so a turn can never reach into a
@@ -765,16 +802,15 @@ def after_prompt(messages: list[dict], mid: str, own: set[str]) -> list[dict] | 
     """
     start = None
     for index, message in enumerate(messages):
-        info = message.get("info")
-        if isinstance(info, dict) and info.get("id") == mid:
+        if as_dict(message.get("info")).get("id") == mid:
             start = index
             break
     if start is None:
         return None
-    window: list[dict] = []
+    window: list[dict[str, object]] = []
     for message in messages[start + 1 :]:
-        info = message.get("info")
-        if not isinstance(info, dict):
+        info = as_dict(message.get("info"))
+        if not info:
             continue
         if info.get("role") == "user" and info.get("id") in own:
             break
@@ -804,13 +840,12 @@ REPLY_TERMINAL = "terminal"
 REPLY_UNRESOLVED = "unresolved"
 
 
-def message_finish(message: dict) -> str | None:
-    info = message.get("info")
-    finish = info.get("finish") if isinstance(info, dict) else None
+def message_finish(message: dict[str, object]) -> str | None:
+    finish = as_dict(message.get("info")).get("finish")
     return finish if isinstance(finish, str) else None
 
 
-def reply_state(message: dict) -> str:
+def reply_state(message: dict[str, object]) -> str:
     """Whether the message this turn selected actually ends the turn.
 
     Selection is `find_reply`'s job; this is only the terminal decision, kept
@@ -831,15 +866,14 @@ def reply_state(message: dict) -> str:
     return REPLY_UNRESOLVED
 
 
-def is_completed(message: dict) -> bool:
-    info = message.get("info")
-    if not isinstance(info, dict):
-        return False
-    time_ = info.get("time")
-    return bool(time_.get("completed")) if isinstance(time_, dict) else False
+def is_completed(message: dict[str, object]) -> bool:
+    stamps = as_dict(as_dict(message.get("info")).get("time"))
+    return bool(stamps.get("completed"))
 
 
-def find_reply(messages: list[dict], mid: str, own: set[str] | None = None) -> dict | None:
+def find_reply(
+    messages: list[dict[str, object]], mid: str, own: set[str] | None = None
+) -> dict[str, object] | None:
     """The assistant message this turn's prompt produced, complete or not.
 
     Usually the child of `mid`. But when the session compacts, the server
@@ -862,8 +896,8 @@ def find_reply(messages: list[dict], mid: str, own: set[str] | None = None) -> d
     direct = None
     chained = None
     for message in window:
-        info = message.get("info")
-        if not isinstance(info, dict) or info.get("role") != "assistant":
+        info = as_dict(message.get("info"))
+        if info.get("role") != "assistant":
             continue
         if is_summary(message):
             continue
@@ -877,7 +911,7 @@ def find_reply(messages: list[dict], mid: str, own: set[str] | None = None) -> d
     return direct
 
 
-def compacting(messages: list[dict], mid: str, own: set[str] | None = None) -> bool:
+def compacting(messages: list[dict[str, object]], mid: str, own: set[str] | None = None) -> bool:
     """True when the server has compacted inside this turn.
 
     The prompt was served, so the absence of a reply is work in progress rather
@@ -887,32 +921,30 @@ def compacting(messages: list[dict], mid: str, own: set[str] | None = None) -> b
     return any(is_compaction(m) for m in window or [])
 
 
-def own_message_ids(meta: dict) -> set[str]:
+def own_message_ids(meta: dict[str, object]) -> set[str]:
     """Every prompt id this tool has sent in this conversation."""
-    turns = meta.get("turns")
-    if not isinstance(turns, list):
-        return set()
-    return {
-        t["mid"] for t in turns if isinstance(t, dict) and isinstance(t.get("mid"), str)
-    }
+    found: set[str] = set()
+    for turn in as_dicts(meta.get("turns")):
+        mid = turn.get("mid")
+        if isinstance(mid, str):
+            found.add(mid)
+    return found
 
 
-def pending_gate(meta: dict) -> tuple[str, dict] | None:
+def pending_gate(meta: dict[str, object]) -> tuple[str, dict[str, object]] | None:
     """The permission or question this session is blocked on, if any.
 
     Both lists are server-wide, so they are filtered down to this session.
     """
     for kind, path in (("permission", "/permission"), ("question", "/question")):
         payload = api("GET", path, params={"directory": meta["repo"]})
-        if not isinstance(payload, list):
-            continue
-        for item in payload:
-            if isinstance(item, dict) and item.get("sessionID") == meta["session_id"]:
+        for item in as_dicts(payload):
+            if item.get("sessionID") == meta["session_id"]:
                 return kind, item
     return None
 
 
-def reply_permission(meta: dict, gate_id: str, response: str) -> None:
+def reply_permission(meta: dict[str, object], gate_id: str, response: str) -> None:
     api(
         "POST",
         f"/session/{meta['session_id']}/permissions/{gate_id}",
@@ -921,7 +953,7 @@ def reply_permission(meta: dict, gate_id: str, response: str) -> None:
     )
 
 
-def reply_question(meta: dict, gate_id: str, labels: list[str]) -> None:
+def reply_question(meta: dict[str, object], gate_id: str, labels: list[str]) -> None:
     """Answer a question gate, one inner list per question asked.
 
     A gate carries a *list* of questions, so `answers` is parallel to it and each
@@ -939,27 +971,20 @@ def reply_question(meta: dict, gate_id: str, labels: list[str]) -> None:
     )
 
 
-def question_options(request: dict) -> list[list[str]]:
+def question_options(request: dict[str, object]) -> list[list[str]]:
     """The option labels of each question in a pending gate, in order."""
-    questions = request.get("questions")
-    if not isinstance(questions, list):
-        return []
     found: list[list[str]] = []
-    for question in questions:
-        if not isinstance(question, dict):
-            continue
+    for question in as_dicts(request.get("questions")):
         labels: list[str] = []
-        options = question.get("options")
-        if isinstance(options, list):
-            for option in options:
-                label = option.get("label") if isinstance(option, dict) else option
-                if isinstance(label, str):
-                    labels.append(label)
+        for option in as_list(question.get("options")):
+            label = as_dict(option).get("label", option)
+            if isinstance(label, str):
+                labels.append(label)
         found.append(labels)
     return found
 
 
-def abort_session(meta: dict) -> None:
+def abort_session(meta: dict[str, object]) -> None:
     api(
         "POST",
         f"/session/{meta['session_id']}/abort",
@@ -1057,12 +1082,8 @@ class Events:
                 return
 
     def _read(self) -> None:
-        url = base_url() + "/event?" + urllib.parse.urlencode(
-            {"directory": self.directory}
-        )
-        request = urllib.request.Request(
-            url, headers={"accept": "text/event-stream"}
-        )
+        url = base_url() + "/event?" + urllib.parse.urlencode({"directory": self.directory})
+        request = urllib.request.Request(url, headers={"accept": "text/event-stream"})
         with urllib.request.urlopen(request, timeout=EVENT_TIMEOUT_S) as stream:
             self.connects += 1
             # On every connect, not only when one drops. Whatever happened while
@@ -1085,18 +1106,16 @@ class Events:
                     self.woken.set()
 
     def _ours(self, event: object) -> bool:
-        if not isinstance(event, dict) or event.get("type") not in WAKE_EVENTS:
+        payload = as_dict(event)
+        if payload.get("type") not in WAKE_EVENTS:
             return False
-        properties = event.get("properties")
-        session = (
-            properties.get("sessionID") if isinstance(properties, dict) else None
-        )
+        session = as_dict(payload.get("properties")).get("sessionID")
         # An event of a type we watch but cannot attribute is taken as ours: the
         # cost is one fetch, and the alternative is missing the turn's own end.
         return session is None or session == self.session_id
 
 
-def subscribe(meta: dict) -> Events:
+def subscribe(meta: dict[str, object]) -> Events:
     """Open the stream for a conversation's session."""
     return Events(str(meta["repo"]), str(meta.get("session_id"))).start()
 
@@ -1105,27 +1124,21 @@ def subscribe(meta: dict) -> Events:
 # turn artifacts
 
 
-def message_text(message: dict) -> str:
-    parts = message.get("parts")
-    if not isinstance(parts, list):
-        return ""
-    chunks = []
-    for part in parts:
-        if isinstance(part, dict) and part.get("type") == "text":
+def message_text(message: dict[str, object]) -> str:
+    chunks: list[str] = []
+    for part in as_dicts(message.get("parts")):
+        if part.get("type") == "text":
             text = part.get("text")
             if isinstance(text, str):
                 chunks.append(text)
     return "".join(chunks)
 
 
-def message_tools(message: dict) -> list[dict]:
-    parts = message.get("parts")
-    if not isinstance(parts, list):
-        return []
-    return [p for p in parts if isinstance(p, dict) and p.get("type") == "tool"]
+def message_tools(message: dict[str, object]) -> list[dict[str, object]]:
+    return [part for part in as_dicts(message.get("parts")) if part.get("type") == "tool"]
 
 
-def parse_structured(text: str) -> dict | None:
+def parse_structured(text: str) -> dict[str, object] | None:
     """Pull the structured envelope out of a reply, or None if it is prose.
 
     Scans for JSON objects rather than for code fences. `answer` routinely
@@ -1150,17 +1163,18 @@ def parse_structured(text: str) -> dict | None:
         except ValueError:
             index = text.find("{", index + 1)
             continue
+        candidate = as_object(value)
         if (
-            isinstance(value, dict)
-            and isinstance(value.get("status"), str)
-            and isinstance(value.get("answer"), str)
+            candidate is not None
+            and isinstance(candidate.get("status"), str)
+            and isinstance(candidate.get("answer"), str)
         ):
-            found = value
+            found = candidate
         index = text.find("{", end)
     return found
 
 
-def message_error(message: dict) -> str | None:
+def message_error(message: dict[str, object]) -> str | None:
     """The reason a reply failed, or None when it did not.
 
     Never the empty string when an error is present. A blank `data.message` used
@@ -1169,14 +1183,11 @@ def message_error(message: dict) -> str | None:
     it was reporting. Whether there *is* an error is `has_error`'s question;
     this one only phrases it.
     """
-    info = message.get("info")
-    error = info.get("error") if isinstance(info, dict) else None
-    if not isinstance(error, dict):
+    error = as_dict(as_dict(message.get("info")).get("error"))
+    if not error:
         return None
     for candidate in (
-        error.get("data", {}).get("message")
-        if isinstance(error.get("data"), dict)
-        else None,
+        as_dict(error.get("data")).get("message"),
         error.get("message"),
         error.get("name"),
     ):
@@ -1185,19 +1196,16 @@ def message_error(message: dict) -> str | None:
     return "opencode reported an error"
 
 
-def has_error(message: dict) -> bool:
+def has_error(message: dict[str, object]) -> bool:
     """Whether the reply carries an error at all, however it is worded."""
-    info = message.get("info")
-    return isinstance(info, dict) and isinstance(info.get("error"), dict)
+    return isinstance(as_dict(message.get("info")).get("error"), dict)
 
 
-def message_usage(message: dict) -> dict:
-    info = message.get("info")
-    tokens = info.get("tokens") if isinstance(info, dict) else None
-    return tokens if isinstance(tokens, dict) else {}
+def message_usage(message: dict[str, object]) -> dict[str, object]:
+    return as_dict(as_dict(message.get("info")).get("tokens"))
 
 
-def message_model(message: dict) -> str:
+def message_model(message: dict[str, object]) -> str:
     """Which model actually answered, as `provider/model` or `provider/model:variant`.
 
     Worth recording on every turn because nothing here chooses it. Without an
@@ -1208,9 +1216,7 @@ def message_model(message: dict) -> str:
     inherited the same way, so a session here can run at a different reasoning
     effort than the same model in the TUI.
     """
-    info = message.get("info")
-    if not isinstance(info, dict):
-        return ""
+    info = as_dict(message.get("info"))
     provider, model = info.get("providerID"), info.get("modelID")
     if not isinstance(provider, str) or not isinstance(model, str):
         return ""
@@ -1226,12 +1232,12 @@ def build_artifacts(
     started_at: float,
     started_iso: str,
     *,
-    reply: dict | None = None,
-    gate: tuple[str, dict] | None = None,
+    reply: dict[str, object] | None = None,
+    gate: tuple[str, dict[str, object]] | None = None,
     cancelled: bool = False,
     failure: str | None = None,
     compacted: bool = False,
-) -> dict:
+) -> dict[str, object]:
     """Turn whatever ended this turn into the .md the caller reads and a .json record."""
     meta = load_meta(conv)
     reply = reply or {}
@@ -1239,10 +1245,7 @@ def build_artifacts(
     # `info.structured` is where opencode would put a schema-validated reply if
     # the API's format field were usable; prefer it, fall back to the envelope
     # the prompt asked for.
-    structured = None
-    info = reply.get("info")
-    if isinstance(info, dict) and isinstance(info.get("structured"), dict):
-        structured = info["structured"]
+    structured = as_object(as_dict(reply.get("info")).get("structured"))
     if structured is None and meta.get("schema"):
         structured = parse_structured(message_text(reply))
     schema_applied = structured is not None
@@ -1253,11 +1256,7 @@ def build_artifacts(
         status = GATE_STATUS[gate[0]]
     elif failure:
         status = STATUS_FAILED
-    elif (
-        schema_applied
-        and isinstance(structured, dict)
-        and structured.get("status") in STRUCTURED_STATUSES
-    ):
+    elif structured is not None and structured.get("status") in STRUCTURED_STATUSES:
         status = structured["status"]
     else:
         status = STATUS_UNKNOWN
@@ -1283,22 +1282,17 @@ def build_artifacts(
         "compacted": compacted,
     }
     turns_dir(conv).mkdir(parents=True, exist_ok=True)
-    turn_file(conv, n, "json").write_text(
-        json.dumps(record, indent=2, ensure_ascii=False) + "\n"
-    )
+    turn_file(conv, n, "json").write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
     turn_file(conv, n, "md").write_text(render_markdown(record))
     return record
 
 
-def summarize_tool(part: dict) -> dict:
-    state = part.get("state")
-    state = state if isinstance(state, dict) else {}
-    payload = state.get("input")
-    payload = payload if isinstance(payload, dict) else {}
+def summarize_tool(part: dict[str, object]) -> dict[str, object]:
+    state = as_dict(part.get("state"))
+    payload = as_dict(state.get("input"))
     output = state.get("output")
     if not isinstance(output, str):
-        error = state.get("error")
-        output = error if isinstance(error, str) else ""
+        output = as_str(state.get("error"))
     return {
         "tool": part.get("tool"),
         "status": state.get("status"),
@@ -1307,15 +1301,14 @@ def summarize_tool(part: dict) -> dict:
     }
 
 
-def gate_command(request: dict) -> str:
-    metadata = request.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
+def gate_command(request: dict[str, object]) -> str:
+    metadata = as_dict(request.get("metadata"))
     for key in ("command", "filePath", "path", "url"):
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             return value
-    patterns = request.get("patterns")
-    if isinstance(patterns, list) and patterns:
+    patterns = as_list(request.get("patterns"))
+    if patterns:
         return str(patterns[0])
     return ""
 
@@ -1331,11 +1324,11 @@ def fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
-def ticked(names: list) -> str:
+def ticked(names: list[object]) -> str:
     return ", ".join(f"`{name}`" for name in names)
 
 
-def compaction_note(record: dict) -> str:
+def compaction_note(record: dict[str, object]) -> str:
     """One line when the server summarised the session inside this turn.
 
     Worth saying: the model answered from a summary of everything before this
@@ -1351,7 +1344,7 @@ def compaction_note(record: dict) -> str:
     )
 
 
-def reason_note(record: dict) -> str:
+def reason_note(record: dict[str, object]) -> str:
     """The caller's own note on why it answered the gate the way it did."""
     reason = record.get("reason")
     if not isinstance(reason, str) or not reason.strip():
@@ -1359,19 +1352,18 @@ def reason_note(record: dict) -> str:
     return f"_your reason, recorded here and never sent to opencode: {reason.strip()}_\n\n"
 
 
-def preapproved_note(record: dict) -> str:
+def preapproved_note(record: dict[str, object]) -> str:
     """One line naming what will never reach the caller as a gate.
 
     A loosened ruleset that nobody can see is the failure mode this file guards
     against, so every turn says which commands were pre-approved and where.
     """
-    summary = record.get("preapproved")
-    if not isinstance(summary, dict):
+    summary = as_dict(record.get("preapproved"))
+    if not summary:
         return ""
 
-    def listed(key: str) -> list:
-        value = summary.get(key)
-        return value if isinstance(value, list) else []
+    def listed(key: str) -> list[object]:
+        return as_list(summary.get(key))
 
     commands = listed("commands")
     anywhere = listed("anywhere")
@@ -1385,7 +1377,7 @@ def preapproved_note(record: dict) -> str:
     roots = listed("roots")
     read_roots = listed("read_roots")
     scope = ", ".join(str(root) for root in roots)
-    clauses = []
+    clauses: list[str] = []
     if commands and roots:
         tail = (
             " and on any path in the session directory (it sits inside a root)"
@@ -1410,43 +1402,40 @@ def preapproved_note(record: dict) -> str:
     if read_roots:
         # A root named on the command line widens this one conversation, so it is
         # called out separately from the standing ones in the file.
-        note = (
-            f"_readable for this conversation via `--read-root`: "
-            f"{ticked(read_roots)}._\n\n"
-        )
+        note = f"_readable for this conversation via `--read-root`: {ticked(read_roots)}._\n\n"
     if not clauses:
         return note
     return note + f"_pre-approved, never gated: {'; '.join(clauses)}._\n\n"
 
 
-def render_markdown(record: dict) -> str:
+def render_markdown(record: dict[str, object]) -> str:
     model = record.get("model")
     head = (
-        f"# {record['conv']} · turn {record['turn']} · {record['status']}"
-        f" · {fmt_duration(record['duration_s'])} · {fmt_usage(record['usage'])}"
+        f"# {as_str(record.get('conv'))} · turn {as_int(record.get('turn'))}"
+        f" · {as_str(record.get('status'))}"
+        f" · {fmt_duration(as_float(record.get('duration_s')))}"
+        f" · {fmt_usage(as_dict(record.get('usage')))}"
         + (f" · {model}" if model else "")
         + "\n\n"
         + preapproved_note(record)
         + reason_note(record)
         + compaction_note(record)
     )
-    gate = record.get("gate")
-    if isinstance(gate, dict):
+    gate = as_dict(record.get("gate"))
+    if gate:
         return head + render_gate(record, gate)
-    if record["failure"]:
-        raw = record["raw"]
+    if record.get("failure"):
+        raw = as_str(record.get("raw"))
         bars = fence(raw)
         return head + f"**opencode failed:** {record['failure']}\n\n{bars}\n{raw}\n{bars}\n"
     if record["status"] == STATUS_CANCELLED:
         return head + "The turn was aborted.\n\n" + progress_section(record)
     if not record["schema_applied"]:
-        raw = record.get("raw", "")
+        raw = as_str(record.get("raw"))
         if raw.strip():
             return (
                 head
-                + (
-                    "_schema not applied — body below is the model's raw final message._\n\n"
-                )
+                + ("_schema not applied — body below is the model's raw final message._\n\n")
                 + raw
             )
         # A rejected tool call ends the turn with no prose at all. Without the
@@ -1456,40 +1445,29 @@ def render_markdown(record: dict) -> str:
             + ("_opencode ended the turn without a final message._\n\n")
             + progress_section(record)
         )
-    parsed = record.get("result")
-    body = parsed.get("answer", "") if isinstance(parsed, dict) else ""
+    parsed = as_dict(record.get("result"))
+    body = parsed.get("answer", "")
     text = head + str(body).rstrip() + "\n"
-    questions = parsed.get("open_questions") if isinstance(parsed, dict) else None
-    if isinstance(questions, list) and questions:
+    questions = as_list(parsed.get("open_questions"))
+    if questions:
         text += "\n## open questions\n\n"
         text += "".join(f"- {q}\n" for q in questions)
     return text
 
 
-def render_gate(record: dict, gate: dict) -> str:
-    request = gate.get("request")
-    request = request if isinstance(request, dict) else {}
-    conv = record["conv"]
+def render_gate(record: dict[str, object], gate: dict[str, object]) -> str:
+    request = as_dict(gate.get("request"))
+    conv = as_str(record.get("conv"))
     if gate.get("kind") == "question":
         text = "opencode is asking you a question and cannot continue until it is answered.\n\n"
-        questions = request.get("questions")
-        if isinstance(questions, list):
-            for question in questions:
-                if not isinstance(question, dict):
-                    continue
-                text += f"**{question.get('message') or question.get('title') or 'question'}**\n\n"
-                options = question.get("options")
-                if isinstance(options, list):
-                    for option in options:
-                        label = (
-                            option.get("label") if isinstance(option, dict) else option
-                        )
-                        text += f"- `{label}`\n"
-                text += "\n"
+        for question in as_dicts(request.get("questions")):
+            text += f"**{question.get('message') or question.get('title') or 'question'}**\n\n"
+            for option in as_list(question.get("options")):
+                text += f"- `{as_dict(option).get('label', option)}`\n"
+            text += "\n"
         text += progress_section(record)
         text += (
-            "## how to continue\n\n"
-            f"```\nask_opencode.py answer {conv} <label> [<label> ...]\n```\n"
+            f"## how to continue\n\n```\nask_opencode.py answer {conv} <label> [<label> ...]\n```\n"
         )
         return text
 
@@ -1500,11 +1478,11 @@ def render_gate(record: dict, gate: dict) -> str:
     )
     if command:
         text += f"```\n{command}\n```\n\n"
-    patterns = request.get("patterns")
-    if isinstance(patterns, list) and patterns:
+    patterns = as_list(request.get("patterns"))
+    if patterns:
         text += "- matched patterns: " + ", ".join(f"`{p}`" for p in patterns) + "\n"
-    always = request.get("always")
-    if isinstance(always, list) and always:
+    always = as_list(request.get("always"))
+    if always:
         text += (
             "- opencode suggests generalising to "
             + ", ".join(f"`{p}`" for p in always)
@@ -1520,15 +1498,15 @@ def render_gate(record: dict, gate: dict) -> str:
     return text
 
 
-def progress_section(record: dict) -> str:
-    tools = record.get("tools")
-    raw = record.get("raw", "")
+def progress_section(record: dict[str, object]) -> str:
+    tools = as_dicts(record.get("tools"))
+    raw = as_str(record.get("raw"))
     if not tools and not raw.strip():
         return ""
     text = "## this turn so far\n\n"
     if raw.strip():
         text += raw.strip() + "\n\n"
-    for tool in tools if isinstance(tools, list) else []:
+    for tool in tools:
         text += f"- `{tool.get('tool')}` {tool.get('status')}: {tool.get('command')}\n"
         # The reason a call failed — a refusal, a ruleset block — lives here and
         # is often the only thing on the page worth reading.
@@ -1545,14 +1523,15 @@ def fmt_duration(seconds: float) -> str:
     return f"{seconds // 60}m{seconds % 60:02d}s"
 
 
-def fmt_usage(usage: dict) -> str:
-    total = usage.get("total")
-    if total is None:
+def fmt_usage(usage: dict[str, object]) -> str:
+    reported = usage.get("total")
+    if reported is None:
         inp, out = usage.get("input"), usage.get("output")
         if inp is None and out is None:
             return "tok n/a"
-        total = (inp or 0) + (out or 0)
-    total = int(total)
+        total = as_int(inp) + as_int(out)
+    else:
+        total = as_int(reported)
     if total >= 1000:
         return f"{total / 1000:.1f}k tok"
     return f"{total} tok"
@@ -1562,13 +1541,14 @@ def fmt_usage(usage: dict) -> str:
 # emitting
 
 
-def emit(record: dict, mode: str) -> None:
-    md_path = turn_file(record["conv"], record["turn"], "md")
+def emit(record: dict[str, object], mode: str) -> None:
+    md_path = turn_file(as_str(record.get("conv")), as_int(record.get("turn")), "md")
     body = md_path.read_text(errors="replace") if md_path.exists() else ""
     model = record.get("model")
     summary = (
         f"[ask-opencode] {record['conv']} · turn {record['turn']} · {record['status']}"
-        f" · {fmt_duration(record['duration_s'])} · {fmt_usage(record['usage'])}"
+        f" · {fmt_duration(as_float(record.get('duration_s')))}"
+        f" · {fmt_usage(as_dict(record.get('usage')))}"
         + (f" · {model}" if model else "")
         + f" · {md_path}"
     )
@@ -1581,7 +1561,7 @@ def emit(record: dict, mode: str) -> None:
         print(body, end="" if body.endswith("\n") else "\n")
 
 
-def exit_code_for(record: dict) -> int:
+def exit_code_for(record: dict[str, object]) -> int:
     if record["status"] == STATUS_CANCELLED:
         return EXIT_CANCELLED
     if record["status"] == STATUS_FAILED:
@@ -1606,19 +1586,22 @@ def open_turn(conv: str, n: int, mid: str, kind: str, reason: str | None = None)
     }
     if reason:
         entry["reason"] = reason
-    meta.setdefault("turns", []).append(entry)
+    turns = as_list(meta.get("turns"))
+    turns.append(entry)
+    meta["turns"] = turns
     save_meta(conv, meta)
 
 
-def turn_reason(meta: dict, n: int) -> str | None:
+def turn_reason(meta: dict[str, object], n: int) -> str | None:
     """The `--reason` the caller gave when it answered the gate this turn resumes."""
-    for entry in meta.get("turns", []):
-        if entry.get("n") == n and isinstance(entry.get("reason"), str):
-            return entry["reason"]
+    for entry in as_dicts(meta.get("turns")):
+        reason = entry.get("reason")
+        if entry.get("n") == n and isinstance(reason, str):
+            return reason
     return None
 
 
-def turn_start(meta: dict, n: int) -> tuple[str, float]:
+def turn_start(meta: dict[str, object], n: int) -> tuple[str, float]:
     """When turn `n` began, from the entry `open_turn` wrote.
 
     Read from meta rather than taken as now, so a turn picked back up by `wait`
@@ -1627,7 +1610,7 @@ def turn_start(meta: dict, n: int) -> tuple[str, float]:
     reattach would make a long turn read as having ended long before it did — and
     `stop --if-idle` reads exactly that.
     """
-    for entry in meta.get("turns", []):
+    for entry in as_dicts(meta.get("turns")):
         if entry.get("n") != n:
             continue
         stamp = entry.get("started_at")
@@ -1640,13 +1623,13 @@ def turn_start(meta: dict, n: int) -> tuple[str, float]:
     return now_iso(), time.time()
 
 
-def close_turn(conv: str, n: int, record: dict) -> None:
+def close_turn(conv: str, n: int, record: dict[str, object]) -> None:
     meta = load_meta(conv)
     meta["current"] = None
     # A gate keeps the message id alive: approve/reject resumes the same reply.
     if not record.get("gate"):
         meta["current_mid"] = None
-    for entry in meta.get("turns", []):
+    for entry in as_dicts(meta.get("turns")):
         if entry.get("n") == n:
             entry["status"] = record["status"]
             entry["duration_s"] = record["duration_s"]
@@ -1688,7 +1671,7 @@ def _await_turn(
     wait_s: float,
     mode: str,
     events: "Events",
-    meta: dict,
+    meta: dict[str, object],
 ) -> int:
     own = own_message_ids(meta)
     started_iso, started_at = turn_start(meta, n)
@@ -1701,7 +1684,7 @@ def _await_turn(
         try:
             gate = pending_gate(meta)
             messages = fetch_messages(meta)
-        except (UsageError, ServerDown):
+        except (UsageError, ServerDownError):
             # The turn belongs to the server, not to this poll. One dropped
             # request, or a server restarting under an hour-long wait, is not a
             # reason to hand the caller an environment error for a turn that is
@@ -1777,7 +1760,7 @@ def _await_turn(
 
         if time.monotonic() >= deadline:
             note = " · compacting" if compacted and reply is None else ""
-            if state == REPLY_UNRESOLVED:
+            if state == REPLY_UNRESOLVED and reply is not None:
                 # Completed, no error, and a `finish` this tool does not know to
                 # be terminal. Held rather than published: the turn stays intact
                 # and recoverable, and the value is named so a change in
@@ -1812,7 +1795,7 @@ def _await_turn(
             time.sleep(idle)
 
 
-def wait_gate_cleared(meta: dict, kind: str, gate_id: str) -> None:
+def wait_gate_cleared(meta: dict[str, object], kind: str, gate_id: str) -> None:
     """Block until the gate we just answered leaves the pending list.
 
     Without this the next poll can re-read the same request and report the gate
@@ -1843,11 +1826,11 @@ def read_stdin_text(what: str) -> str:
     return text
 
 
-def next_turn_number(meta: dict) -> int:
-    return len(meta.get("turns", [])) + 1
+def next_turn_number(meta: dict[str, object]) -> int:
+    return len(as_list(meta.get("turns"))) + 1
 
 
-def require_idle(conv: str) -> dict:
+def require_idle(conv: str) -> dict[str, object]:
     meta = load_meta(conv)
     if meta.get("current"):
         raise UsageError(
@@ -1857,9 +1840,7 @@ def require_idle(conv: str) -> dict:
     return meta
 
 
-def resume_after_gate(
-    conv: str, wait_s: float, mode: str, reason: str | None = None
-) -> int:
+def resume_after_gate(conv: str, wait_s: float, mode: str, reason: str | None = None) -> int:
     meta = load_meta(conv)
     mid = meta.get("current_mid")
     if not isinstance(mid, str):
@@ -1869,26 +1850,26 @@ def resume_after_gate(
     return await_turn(conv, n, mid, wait_s, mode)
 
 
-def last_gate(conv: str) -> tuple[str, dict]:
+def last_gate(conv: str) -> tuple[str, dict[str, object]]:
     meta = load_meta(conv)
-    turns = meta.get("turns", [])
+    turns = as_dicts(meta.get("turns"))
     if not turns:
         raise UsageError(f"{conv} has no turns yet.")
-    record_path = turn_file(conv, turns[-1]["n"], "json")
+    last = as_int(turns[-1].get("n"))
     try:
-        record = json.loads(record_path.read_text())
-    except (OSError, ValueError):
-        raise UsageError(f"{conv} has no stored result for turn {turns[-1]['n']}.")
-    gate = record.get("gate")
-    if not isinstance(gate, dict):
-        raise UsageError(
-            f"{conv} is not waiting on a gate (last turn was {record.get('status')})."
-        )
-    request = gate.get("request")
-    return str(gate.get("kind")), request if isinstance(request, dict) else {}
+        text = turn_file(conv, last, "json").read_text()
+    except OSError as err:
+        raise UsageError(f"{conv} has no stored result for turn {last}.") from err
+    record = json_object(text)
+    if record is None:
+        raise UsageError(f"{conv} has no stored result for turn {last}.")
+    gate = as_dict(record.get("gate"))
+    if not gate:
+        raise UsageError(f"{conv} is not waiting on a gate (last turn was {record.get('status')}).")
+    return as_str(gate.get("kind")), as_dict(gate.get("request"))
 
 
-def cmd_start(args) -> int:
+def cmd_start(args: argparse.Namespace) -> int:
     task = read_stdin_text("task text")
     repo = Path(args.repo).expanduser().resolve()
     if not repo.is_dir():
@@ -1928,15 +1909,13 @@ def cmd_start(args) -> int:
         try:
             preapproved = policy.load_preapproved()
         except policy.PreapprovedError as exc:
-            raise UsageError(str(exc))
+            raise UsageError(str(exc)) from exc
 
     ensure_server()
     conv = mint_conv_id(args.name, task)
     if conv_dir(conv).exists():
-        raise UsageError(
-            f"conversation {conv} already exists; run start again for a new id."
-        )
-    meta = {
+        raise UsageError(f"conversation {conv} already exists; run start again for a new id.")
+    meta: dict[str, object] = {
         "conv": conv,
         "name": args.name,
         "created_at": now_iso(),
@@ -1978,7 +1957,7 @@ def cmd_start(args) -> int:
         events.close()
 
 
-def cmd_send(args) -> int:
+def cmd_send(args: argparse.Namespace) -> int:
     text = read_stdin_text("message text")
     meta = require_idle(args.conv)
     if meta.get("current_mid"):
@@ -2002,27 +1981,30 @@ def cmd_send(args) -> int:
         events.close()
 
 
-def cmd_wait(args) -> int:
+def cmd_wait(args: argparse.Namespace) -> int:
     meta = load_meta(args.conv)
-    n = meta.get("current")
+    n = as_int(meta.get("current"))
     if n:
         mid = meta.get("current_mid")
         if not isinstance(mid, str):
             raise UsageError(f"{args.conv} has a turn in flight with no message id.")
         return await_turn(args.conv, n, mid, args.wait, args.emit)
-    turns = meta.get("turns", [])
+    turns = as_dicts(meta.get("turns"))
     if not turns:
         raise UsageError(f"{args.conv} has no turns yet.")
-    last = turns[-1]["n"]
+    last = as_int(turns[-1].get("n"))
     try:
-        record = json.loads(turn_file(args.conv, last, "json").read_text())
-    except (OSError, ValueError):
+        text = turn_file(args.conv, last, "json").read_text()
+    except OSError as err:
+        raise UsageError(f"{args.conv} has no stored result for turn {last}.") from err
+    record = json_object(text)
+    if record is None:
         raise UsageError(f"{args.conv} has no stored result for turn {last}.")
     emit(record, args.emit)
     return exit_code_for(record)
 
 
-def cmd_approve(args) -> int:
+def cmd_approve(args: argparse.Namespace) -> int:
     kind, request = last_gate(args.conv)
     if kind != "permission":
         raise UsageError(f"{args.conv} is waiting on a {kind}, not a permission.")
@@ -2037,7 +2019,7 @@ def cmd_approve(args) -> int:
     return resume_after_gate(args.conv, args.wait, args.emit, args.reason)
 
 
-def cmd_reject(args) -> int:
+def cmd_reject(args: argparse.Namespace) -> int:
     kind, request = last_gate(args.conv)
     if kind != "permission":
         raise UsageError(f"{args.conv} is waiting on a {kind}, not a permission.")
@@ -2049,7 +2031,7 @@ def cmd_reject(args) -> int:
     return resume_after_gate(args.conv, args.wait, args.emit, args.reason)
 
 
-def cmd_answer(args) -> int:
+def cmd_answer(args: argparse.Namespace) -> int:
     kind, request = last_gate(args.conv)
     if kind != "question":
         raise UsageError(f"{args.conv} is waiting on a {kind}, not a question.")
@@ -2062,11 +2044,10 @@ def cmd_answer(args) -> int:
             f"{args.conv} is waiting on {len(options)} question(s) and takes one "
             f"label each, in order; got {len(args.labels)}."
         )
-    for label, choices in zip(args.labels, options):
+    for label, choices in zip(args.labels, options, strict=True):
         if choices and label not in choices:
             raise UsageError(
-                f"{label!r} is not one of that question's options: "
-                + ", ".join(choices)
+                f"{label!r} is not one of that question's options: " + ", ".join(choices)
             )
     meta = require_idle(args.conv)
     ensure_server()
@@ -2076,7 +2057,7 @@ def cmd_answer(args) -> int:
     return resume_after_gate(args.conv, args.wait, args.emit)
 
 
-def cmd_list() -> int:
+def cmd_list(_args: argparse.Namespace) -> int:
     convs = list_convs()
     if not convs:
         print("no conversations yet.")
@@ -2086,14 +2067,14 @@ def cmd_list() -> int:
             meta = load_meta(conv)
         except UsageError:
             continue
-        turns = meta.get("turns", [])
-        last = turns[-1]["status"] if turns else "-"
+        turns = as_dicts(meta.get("turns"))
+        last = str(turns[-1].get("status")) if turns else "-"
         flag = "running" if meta.get("current") else last
         print(f"{conv:<32} turns={len(turns):<3} {flag:<16} {meta.get('repo', '')}")
     return EXIT_OK
 
 
-def cmd_models(args) -> int:
+def cmd_models(args: argparse.Namespace) -> int:
     """List what this server can actually be asked for.
 
     `--model` is only usable if the caller can learn a legal value, and nothing
@@ -2133,12 +2114,12 @@ def cmd_models(args) -> int:
     return EXIT_OK
 
 
-def cmd_show(args) -> int:
+def cmd_show(args: argparse.Namespace) -> int:
     meta = load_meta(args.conv)
-    turns = meta.get("turns", [])
+    turns = as_dicts(meta.get("turns"))
     if not turns:
         raise UsageError(f"{args.conv} has no turns yet.")
-    n = args.turn or turns[-1]["n"]
+    n = args.turn or as_int(turns[-1].get("n"))
     path = turn_file(args.conv, n, "md")
     if not path.exists():
         raise UsageError(f"turn {n} of {args.conv} has no stored result.")
@@ -2155,7 +2136,7 @@ def cancel_conversation(conv: str) -> int | None:
     that behind.
     """
     meta = load_meta(conv)
-    n = meta.get("current")
+    n = as_int(meta.get("current"))
     if not n:
         return None
     mid = meta.get("current_mid")
@@ -2165,7 +2146,7 @@ def cancel_conversation(conv: str) -> int | None:
     # adds the two — so cancelling a long turn would make it look as though it
     # had ended near its beginning, and `stop --if-idle` would collect the
     # server immediately afterwards.
-    started_iso, started_at = turn_start(meta, int(n))
+    started_iso, started_at = turn_start(meta, n)
     record = build_artifacts(
         conv,
         n,
@@ -2176,10 +2157,10 @@ def cancel_conversation(conv: str) -> int | None:
         cancelled=True,
     )
     close_turn(conv, n, record)
-    return int(n)
+    return n
 
 
-def cmd_cancel(args) -> int:
+def cmd_cancel(args: argparse.Namespace) -> int:
     n = cancel_conversation(args.conv)
     if n is None:
         print(f"[ask-opencode] {args.conv} has no turn in flight.")
@@ -2188,7 +2169,7 @@ def cmd_cancel(args) -> int:
     return EXIT_CANCELLED
 
 
-def cmd_stop(args) -> int:
+def cmd_stop(args: argparse.Namespace) -> int:
     """Stop the server this tool would otherwise leave running forever."""
     if os.environ.get("ASK_OPENCODE_URL"):
         raise UsageError(
@@ -2212,8 +2193,7 @@ def cmd_stop(args) -> int:
         # Unattended guard: report and leave, never cancel someone's turn.
         if busy:
             print(
-                f"[ask-opencode] server on port {PORT} is busy · "
-                f"{', '.join(busy)} · left running"
+                f"[ask-opencode] server on port {PORT} is busy · {', '.join(busy)} · left running"
             )
             return EXIT_OK
         idle = idle_seconds(metas)
@@ -2237,20 +2217,15 @@ def cmd_stop(args) -> int:
             "(is lsof installed?); stop it by hand."
         )
 
-    cancelled = []
+    cancelled: list[str] = []
     if busy and args.force:
-        for conv in busy:
-            if cancel_conversation(conv) is not None:
-                cancelled.append(conv)
+        cancelled.extend(conv for conv in busy if cancel_conversation(conv) is not None)
 
     started = time.monotonic()
     how = signal_server(pid, args.timeout)
     took = fmt_duration(time.monotonic() - started)
     note = f" · cancelled {', '.join(cancelled)}" if cancelled else ""
-    print(
-        f"[ask-opencode] server stopped · pid {pid} · port {PORT} · "
-        f"{took} · {how}{note}"
-    )
+    print(f"[ask-opencode] server stopped · pid {pid} · port {PORT} · {took} · {how}{note}")
     return EXIT_OK
 
 
@@ -2261,7 +2236,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ask_opencode.py", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    def add_wait_opts(p):
+    def add_wait_opts(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--wait",
             type=float,
@@ -2289,17 +2264,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="model variant to run every turn at, e.g. xhigh — the "
         "reasoning-effort presets the provider lists for the model",
     )
-    start.add_argument(
-        "--agent", default=None, help="opencode agent, e.g. build or plan"
-    )
+    start.add_argument("--agent", default=None, help="opencode agent, e.g. build or plan")
     start.add_argument(
         "--schema",
         default=str(DEFAULT_SCHEMA),
         help="JSON Schema for the final message, or 'none'",
     )
-    start.add_argument(
-        "--name", default=None, help="readable prefix for the conversation id"
-    )
+    start.add_argument("--name", default=None, help="readable prefix for the conversation id")
     start.add_argument(
         "--read-root",
         action="append",
@@ -2329,9 +2300,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_wait_opts(wait)
     wait.set_defaults(func=cmd_wait)
 
-    approve = sub.add_parser(
-        "approve", help="allow the pending tool call, then keep waiting"
-    )
+    approve = sub.add_parser("approve", help="allow the pending tool call, then keep waiting")
     approve.add_argument("conv")
     approve.add_argument(
         "--reason",
@@ -2342,9 +2311,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_wait_opts(approve)
     approve.set_defaults(func=cmd_approve)
 
-    reject = sub.add_parser(
-        "reject", help="refuse the pending tool call, then keep waiting"
-    )
+    reject = sub.add_parser("reject", help="refuse the pending tool call, then keep waiting")
     reject.add_argument("conv")
     reject.add_argument(
         "--reason",
@@ -2355,22 +2322,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_wait_opts(reject)
     reject.set_defaults(func=cmd_reject)
 
-    answer = sub.add_parser(
-        "answer", help="answer the pending question, then keep waiting"
-    )
+    answer = sub.add_parser("answer", help="answer the pending question, then keep waiting")
     answer.add_argument("conv")
-    answer.add_argument(
-        "labels", nargs="+", help="chosen option labels, in question order"
-    )
+    answer.add_argument("labels", nargs="+", help="chosen option labels, in question order")
     add_wait_opts(answer)
     answer.set_defaults(func=cmd_answer)
 
     listing = sub.add_parser("list", help="list conversations")
-    listing.set_defaults(func=lambda _: cmd_list())
+    listing.set_defaults(func=cmd_list)
 
-    models = sub.add_parser(
-        "models", help="list the models and variants this server can reach"
-    )
+    models = sub.add_parser("models", help="list the models and variants this server can reach")
     models.add_argument(
         "--repo",
         default=".",
@@ -2419,7 +2380,7 @@ def main(argv: list[str]) -> int:
     except UsageError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ENV
-    except ServerDown as exc:
+    except ServerDownError as exc:
         print(f"ERROR: opencode server unreachable: {exc}", file=sys.stderr)
         return EXIT_ENV
     except KeyboardInterrupt:

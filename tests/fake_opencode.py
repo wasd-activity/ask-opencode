@@ -61,23 +61,84 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
-DEFAULT_TOKENS = {"total": 2000, "input": 1200, "output": 800, "reasoning": 0,
-                  "cache": {"read": 0, "write": 0}}
-DEFAULT_PROVIDERS = {
-    "providers": [{"id": "test-provider",
-                   "models": {"model-a": {}, "model-b": {}}}],
+Json = dict[str, object]
+
+
+# The double stays independent of the driver, so the narrowing it needs for a
+# decoded script or request body is written here rather than imported from it.
+def as_dict(value: object) -> Json:
+    return cast("Json", value) if isinstance(value, dict) else {}
+
+
+def as_object(value: object) -> Json | None:
+    return cast("Json", value) if isinstance(value, dict) else None
+
+
+def as_list(value: object) -> list[object]:
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def as_str(value: object, default: str = "") -> str:
+    return value if isinstance(value, str) else default
+
+
+def as_int(value: object, default: int = 0) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def as_float(value: object, default: float = 0.0) -> float:
+    return (
+        float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+    )
+
+
+class Message(TypedDict):
+    info: Json
+    parts: list[Json]
+
+
+class Session(TypedDict):
+    permission: object
+    directory: str | None
+    messages: list[Message]
+
+
+class Event(TypedDict):
+    _directory: str | None
+    event: Json
+
+
+class State(TypedDict):
+    sessions: dict[str, Session]
+    gates: list[Json]
+    turn: int
+    seq: int
+    events: list[Event]
+    on_drop: tuple[str, str, Json] | None
+
+
+DEFAULT_TOKENS = {
+    "total": 2000,
+    "input": 1200,
+    "output": 800,
+    "reasoning": 0,
+    "cache": {"read": 0, "write": 0},
+}
+DEFAULT_PROVIDERS: Json = {
+    "providers": [{"id": "test-provider", "models": {"model-a": {}, "model-b": {}}}],
     "default": {"test-provider": "model-b"},
 }
 
-STATE = {
-    "sessions": {},     # sid -> {"permission": [...], "directory": str, "messages": [...]}
-    "gates": [],        # pending gate requests, each with _kind
-    "turn": 0,          # how many prompts have been received
+STATE: State = {
+    "sessions": {},  # sid -> {"permission": [...], "directory": str, "messages": [...]}
+    "gates": [],  # pending gate requests, each with _kind
+    "turn": 0,  # how many prompts have been received
     "seq": 0,
-    "events": [],       # broadcast to every /event subscriber, append-only
-    "on_drop": None,    # (sid, mid, spec) held until a stream is dropped
+    "events": [],  # broadcast to every /event subscriber, append-only
+    "on_drop": None,  # (sid, mid, spec) held until a stream is dropped
 }
 LOCK = threading.Lock()
 
@@ -94,18 +155,18 @@ def flaky_read() -> bool:
     return True
 
 
-def script() -> dict:
+def script() -> Json:
     path = os.environ.get("FAKE_OPENCODE_SCRIPT")
     if not path or not os.path.exists(path):
         return {"turns": []}
     with open(path) as handle:
-        return json.load(handle)
+        return as_dict(json.load(handle))
 
 
-def turn_spec(index: int) -> dict:
-    turns = script().get("turns", [])
+def turn_spec(index: int) -> Json:
+    turns = as_list(script().get("turns"))
     if index < len(turns):
-        return turns[index]
+        return as_dict(turns[index])
     return {}
 
 
@@ -116,11 +177,11 @@ MODEL_KEYS = {"/session": {"providerID", "id"}, "prompt_async": {"providerID", "
 
 
 def model_shape_error(where: str, body: object) -> str | None:
-    request = body if isinstance(body, dict) else {}
-    model = request.get("model")
-    if model is None:
+    raw = as_dict(body).get("model")
+    if raw is None:
         return None
-    if not isinstance(model, dict):
+    model = as_object(raw)
+    if model is None:
         return f"{where}: model must be an object"
     missing = MODEL_KEYS[where] - set(model)
     if missing:
@@ -136,11 +197,12 @@ def emit(kind: str, sid: str) -> None:
     carried alongside, not inside the event, because the real stream is scoped by
     the subscriber's `directory` query parameter rather than by the payload.
     """
-    session = STATE["sessions"].get(sid) or {}
+    session = STATE["sessions"].get(sid)
     STATE["events"].append(
-        {"_directory": session.get("directory"),
-         "event": {"id": next_id("evt"), "type": kind,
-                   "properties": {"sessionID": sid}}}
+        {
+            "_directory": session["directory"] if session else None,
+            "event": {"id": next_id("evt"), "type": kind, "properties": {"sessionID": sid}},
+        }
     )
 
 
@@ -157,14 +219,14 @@ def next_id(prefix: str) -> str:
     return f"{prefix}_{STATE['seq']:012d}"
 
 
-def reply_text(spec: dict) -> str:
+def reply_text(spec: Json) -> str:
     """What the model actually writes.
 
     The real server cannot carry a schema on the request — storing anything in
     prompt_async's `format` makes later message reads fail — so the envelope
     arrives as a fenced block in the reply text, and the fake mirrors that.
     """
-    body = spec.get("text", "here is the answer")
+    body = as_str(spec.get("text"), "here is the answer")
     if spec.get("unstructured"):
         return body
     envelope = {
@@ -175,19 +237,20 @@ def reply_text(spec: dict) -> str:
     return f"{body}\n\n```json\n{json.dumps(envelope)}\n```\n"
 
 
-def complete_reply(sid: str, mid: str, spec: dict, rejected: bool = False) -> None:
+def complete_reply(sid: str, mid: str, spec: Json, rejected: bool = False) -> None:
     """Mark the assistant message for `mid` finished, per the turn's spec."""
     for message in STATE["sessions"][sid]["messages"]:
         info = message["info"]
+        stamps = as_dict(info.get("time"))
         if (
             info.get("parentID") == mid
             and info.get("role") == "assistant"
             # The one still open. Picking the first child would re-stamp a
             # completed intermediate step as the turn's `stop` and leave the
             # real answer unfinished for good.
-            and info["time"].get("completed") is None
+            and stamps.get("completed") is None
         ):
-            info["time"]["completed"] = int(time.time() * 1000)
+            stamps["completed"] = int(time.time() * 1000)
             info["finish"] = spec.get("finish", "stop")
             emit("message.updated", sid)
             emit("session.idle", sid)
@@ -196,10 +259,15 @@ def complete_reply(sid: str, mid: str, spec: dict, rejected: bool = False) -> No
                 # tool call is refused; only the failed tool part remains.
                 message["parts"] = [
                     {"type": "text", "text": ""},
-                    {"type": "tool", "tool": "bash",
-                     "state": {"status": "error", "input": {"command": "date +%Y"},
-                               "error": "The user rejected permission to use this "
-                                        "specific tool call."}},
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "error",
+                            "input": {"command": "date +%Y"},
+                            "error": "The user rejected permission to use this specific tool call.",
+                        },
+                    },
                 ]
                 return
             if spec.get("error"):
@@ -211,8 +279,10 @@ def complete_reply(sid: str, mid: str, spec: dict, rejected: bool = False) -> No
             return
 
 
-CONTINUE_TEXT = ("Continue if you have next steps, or stop and ask for "
-                 "clarification if you are unsure how to proceed.")
+CONTINUE_TEXT = (
+    "Continue if you have next steps, or stop and ask for "
+    "clarification if you are unsure how to proceed."
+)
 
 
 def open_compaction(sid: str, mid: str) -> None:
@@ -225,14 +295,21 @@ def open_compaction(sid: str, mid: str) -> None:
     del mid
     now = int(time.time() * 1000)
     STATE["sessions"][sid]["messages"].append(
-        {"info": {"id": next_id("msg"), "sessionID": sid, "role": "user",
-                  "summary": {"diffs": []}, "time": {"created": now}},
-         "parts": [{"type": "compaction", "auto": True, "overflow": False}]}
+        {
+            "info": {
+                "id": next_id("msg"),
+                "sessionID": sid,
+                "role": "user",
+                "summary": {"diffs": []},
+                "time": {"created": now},
+            },
+            "parts": [{"type": "compaction", "auto": True, "overflow": False}],
+        }
     )
     emit("session.compacted", sid)
 
 
-def close_compaction(sid: str, mid: str, spec: dict) -> None:
+def close_compaction(sid: str, mid: str, spec: Json) -> None:
     """The rest of a compaction: summary, synthetic continue, then the answer.
 
     The answer is parented to the continue message the server writes, never to
@@ -243,40 +320,71 @@ def close_compaction(sid: str, mid: str, spec: dict) -> None:
     session = STATE["sessions"][sid]
     now = int(time.time() * 1000)
     compaction_id = next(
-        m["info"]["id"] for m in reversed(session["messages"])
-        if any(p.get("type") == "compaction" for p in m["parts"])
+        m["info"]["id"]
+        for m in reversed(session["messages"])
+        if any(part.get("type") == "compaction" for part in m["parts"])
     )
     session["messages"].append(
-        {"info": {"id": next_id("msg"), "sessionID": sid, "role": "assistant",
-                  "parentID": compaction_id, "summary": True,
-                  "time": {"created": now, "completed": now},
-                  "providerID": spec.get("providerID", "test-provider"),
-                  "modelID": spec.get("modelID", "model-a"),
-                  "tokens": DEFAULT_TOKENS, "cost": 0, "finish": "stop"},
-         "parts": [{"type": "text", "text": "## Objective\nsummary of the session so far"}]}
+        {
+            "info": {
+                "id": next_id("msg"),
+                "sessionID": sid,
+                "role": "assistant",
+                "parentID": compaction_id,
+                "summary": True,
+                "time": {"created": now, "completed": now},
+                "providerID": spec.get("providerID", "test-provider"),
+                "modelID": spec.get("modelID", "model-a"),
+                "tokens": DEFAULT_TOKENS,
+                "cost": 0,
+                "finish": "stop",
+            },
+            "parts": [{"type": "text", "text": "## Objective\nsummary of the session so far"}],
+        }
     )
     continue_id = next_id("msg")
     session["messages"].append(
-        {"info": {"id": continue_id, "sessionID": sid, "role": "user",
-                  "summary": {"diffs": []}, "time": {"created": now}},
-         "parts": [{"type": "text", "text": CONTINUE_TEXT, "synthetic": True,
-                    "metadata": {"compaction_continue": True}}]}
+        {
+            "info": {
+                "id": continue_id,
+                "sessionID": sid,
+                "role": "user",
+                "summary": {"diffs": []},
+                "time": {"created": now},
+            },
+            "parts": [
+                {
+                    "type": "text",
+                    "text": CONTINUE_TEXT,
+                    "synthetic": True,
+                    "metadata": {"compaction_continue": True},
+                }
+            ],
+        }
     )
     session["messages"].append(
-        {"info": {"id": next_id("msg"), "sessionID": sid, "role": "assistant",
-                  "parentID": continue_id,
-                  "time": {"created": now, "completed": now},
-                  "providerID": spec.get("providerID", "test-provider"),
-                  "modelID": spec.get("modelID", "model-a"),
-                  "variant": spec.get("variant", "default"), "finish": "stop",
-                  "tokens": spec.get("tokens", DEFAULT_TOKENS), "cost": 0},
-         "parts": [{"type": "text", "text": reply_text(spec)}]}
+        {
+            "info": {
+                "id": next_id("msg"),
+                "sessionID": sid,
+                "role": "assistant",
+                "parentID": continue_id,
+                "time": {"created": now, "completed": now},
+                "providerID": spec.get("providerID", "test-provider"),
+                "modelID": spec.get("modelID", "model-a"),
+                "variant": spec.get("variant", "default"),
+                "finish": "stop",
+                "tokens": spec.get("tokens", DEFAULT_TOKENS),
+                "cost": 0,
+            },
+            "parts": [{"type": "text", "text": reply_text(spec)}],
+        }
     )
     emit("message.updated", sid)
     emit("session.idle", sid)
 
 
-def _locked_close_compaction(sid: str, mid: str, spec: dict) -> None:
+def _locked_close_compaction(sid: str, mid: str, spec: Json) -> None:
     with LOCK:
         close_compaction(sid, mid, spec)
 
@@ -301,16 +409,16 @@ def start_turn(sid: str, mid: str) -> None:
     session = STATE["sessions"][sid]
     now = int(time.time() * 1000)
     session["messages"].append(
-        {"info": {"id": mid, "sessionID": sid, "role": "user", "time": {"created": now}},
-         "parts": [{"type": "text", "text": spec.get("prompt_echo", "")}]}
+        {
+            "info": {"id": mid, "sessionID": sid, "role": "user", "time": {"created": now}},
+            "parts": [{"type": "text", "text": spec.get("prompt_echo", "")}],
+        }
     )
     if spec.get("compaction"):
         open_compaction(sid, mid)
-        delay = float(spec.get("delay_s", 0))
+        delay = as_float(spec.get("delay_s"))
         if delay:
-            threading.Timer(
-                delay, lambda: _locked_close_compaction(sid, mid, spec)
-            ).start()
+            threading.Timer(delay, lambda: _locked_close_compaction(sid, mid, spec)).start()
         else:
             close_compaction(sid, mid, spec)
         return
@@ -321,25 +429,41 @@ def start_turn(sid: str, mid: str) -> None:
     storm = int(os.environ.get("FAKE_OPENCODE_EVENT_STORM", 0))
     if storm:
         threading.Thread(target=_storm, args=(sid, storm), daemon=True).start()
-    steps = int(spec.get("tool_steps", 0))
+    steps = as_int(spec.get("tool_steps"))
     for _ in range(steps):
         session["messages"].append(
-            {"info": {"id": next_id("msg"), "sessionID": sid, "role": "assistant",
-                      "parentID": mid, "finish": "tool-calls",
-                      "time": {"created": now, "completed": now},
-                      "providerID": spec.get("providerID", "test-provider"),
-                      "modelID": spec.get("modelID", "model-a"),
-                      "variant": spec.get("variant", "default"),
-                      "tokens": spec.get("tokens", DEFAULT_TOKENS), "cost": 0},
-             "parts": [{"type": "text", "text": "calling a tool"},
-                       {"type": "tool", "tool": "read",
-                        "state": {"status": "completed", "input": {"filePath": "note.txt"},
-                                  "output": "..."}}]}
+            {
+                "info": {
+                    "id": next_id("msg"),
+                    "sessionID": sid,
+                    "role": "assistant",
+                    "parentID": mid,
+                    "finish": "tool-calls",
+                    "time": {"created": now, "completed": now},
+                    "providerID": spec.get("providerID", "test-provider"),
+                    "modelID": spec.get("modelID", "model-a"),
+                    "variant": spec.get("variant", "default"),
+                    "tokens": spec.get("tokens", DEFAULT_TOKENS),
+                    "cost": 0,
+                },
+                "parts": [
+                    {"type": "text", "text": "calling a tool"},
+                    {
+                        "type": "tool",
+                        "tool": "read",
+                        "state": {
+                            "status": "completed",
+                            "input": {"filePath": "note.txt"},
+                            "output": "...",
+                        },
+                    },
+                ],
+            }
         )
         # The real server announces a completed step the same way it announces a
         # completed turn, which is what puts a driver inside the window.
         emit("message.updated", sid)
-    delay = float(spec.get("delay_s", 0))
+    delay = as_float(spec.get("delay_s"))
     if steps and delay:
         # The answer does not exist yet: for `delay` seconds the newest child of
         # this prompt is a completed intermediate step. Deferred through the same
@@ -349,7 +473,7 @@ def start_turn(sid: str, mid: str) -> None:
     deliver_reply(sid, mid, spec)
 
 
-def deliver_reply(sid: str, mid: str, spec: dict, delayed: bool = False) -> None:
+def deliver_reply(sid: str, mid: str, spec: Json, delayed: bool = False) -> None:
     """The turn's answer, the gates it may stop at, and its completion.
 
     One function for both paths. `delayed` only says the wait already happened,
@@ -357,21 +481,34 @@ def deliver_reply(sid: str, mid: str, spec: dict, delayed: bool = False) -> None
     """
     session = STATE["sessions"][sid]
     now = int(time.time() * 1000)
-    parts = [{"type": "text", "text": reply_text(spec)}]
-    for tool in spec.get("tools", []):
-        parts.append({"type": "tool", "tool": tool.get("tool", "bash"),
-                      "state": tool.get("state", {"status": "completed"})})
+    parts: list[Json] = [{"type": "text", "text": reply_text(spec)}]
+    parts.extend(
+        {
+            "type": "tool",
+            "tool": as_dict(tool).get("tool", "bash"),
+            "state": as_dict(tool).get("state", {"status": "completed"}),
+        }
+        for tool in as_list(spec.get("tools"))
+    )
     session["messages"].append(
-        {"info": {"id": next_id("msg"), "sessionID": sid, "role": "assistant",
-                  "parentID": mid, "time": {"created": now, "completed": None},
-                  "providerID": spec.get("providerID", "test-provider"),
-                  "modelID": spec.get("modelID", "model-a"),
-                  "variant": spec.get("variant", "default"),
-                  "tokens": spec.get("tokens", DEFAULT_TOKENS), "cost": 0},
-         "parts": parts}
+        {
+            "info": {
+                "id": next_id("msg"),
+                "sessionID": sid,
+                "role": "assistant",
+                "parentID": mid,
+                "time": {"created": now, "completed": None},
+                "providerID": spec.get("providerID", "test-provider"),
+                "modelID": spec.get("modelID", "model-a"),
+                "variant": spec.get("variant", "default"),
+                "tokens": spec.get("tokens", DEFAULT_TOKENS),
+                "cost": 0,
+            },
+            "parts": parts,
+        }
     )
     emit("message.updated", sid)
-    gate_delay = float(spec.get("gate_delay_s", 0))
+    gate_delay = as_float(spec.get("gate_delay_s"))
     if gate_delay:
         # A gate that is not already pending when the driver first looks, so
         # only the stream can tell it one arrived.
@@ -390,16 +527,16 @@ def deliver_reply(sid: str, mid: str, spec: dict, delayed: bool = False) -> None
         # subscriber has something to receive and be dropped on.
         STATE["on_drop"] = (sid, mid, spec)
         return
-    delay = 0.0 if delayed else float(spec.get("delay_s", 0))
+    delay = 0.0 if delayed else as_float(spec.get("delay_s"))
     if delay:
         threading.Timer(delay, lambda: _locked_complete(sid, mid, spec)).start()
     else:
         complete_reply(sid, mid, spec)
 
 
-def raise_gates(sid: str, spec: dict) -> None:
-    for gate in spec.get("gates", []):
-        entry = dict(gate)
+def raise_gates(sid: str, spec: Json) -> None:
+    for gate in as_list(spec.get("gates")):
+        entry = dict(as_dict(gate))
         entry.setdefault(
             "id",
             next_id("per" if entry.get("_kind", "permission") == "permission" else "que"),
@@ -412,17 +549,17 @@ def raise_gates(sid: str, spec: dict) -> None:
         )
 
 
-def _locked_raise_gates(sid: str, spec: dict) -> None:
+def _locked_raise_gates(sid: str, spec: Json) -> None:
     with LOCK:
         raise_gates(sid, spec)
 
 
-def _locked_deliver(sid: str, mid: str, spec: dict) -> None:
+def _locked_deliver(sid: str, mid: str, spec: Json) -> None:
     with LOCK:
         deliver_reply(sid, mid, spec, delayed=True)
 
 
-def _locked_complete(sid: str, mid: str, spec: dict) -> None:
+def _locked_complete(sid: str, mid: str, spec: Json) -> None:
     with LOCK:
         complete_reply(sid, mid, spec)
 
@@ -440,23 +577,24 @@ def clear_gate(gate_id: str, response: str = "once") -> None:
     for sid, session in STATE["sessions"].items():
         for message in session["messages"]:
             info = message["info"]
-            if info.get("role") == "assistant" and info["time"].get("completed") is None:
-                complete_reply(sid, str(info.get("parentID")), spec,
-                               rejected=(response == "reject"))
+            stamps = as_dict(info.get("time"))
+            if info.get("role") == "assistant" and stamps.get("completed") is None:
+                complete_reply(
+                    sid, str(info.get("parentID")), spec, rejected=(response == "reject")
+                )
                 return
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, format: str, *args: object) -> None:  # keep test output clean
+    # `format` shadows a builtin, but the name is the base class's, not ours.
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        """Keep the test output clean."""
         del format, args
 
     def _send(self, code: int, payload: object) -> None:
-        if payload is None:
-            body = b""
-        else:
-            body = json.dumps(payload).encode()
+        body = b"" if payload is None else json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -473,7 +611,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
-    def _write_event(self, event: dict) -> None:
+    def _write_event(self, event: Json) -> None:
         self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
         self.wfile.flush()
 
@@ -489,7 +627,7 @@ class Handler(BaseHTTPRequestHandler):
         # it receives nothing for the session, silently rather than as an error.
         # A fake that broadcast regardless could not tell that failure from a
         # working stream, which is the whole point of the parameter.
-        wanted = parse_qs(urlparse(self.path).query).get("directory", [None])[0]
+        wanted = (parse_qs(urlparse(self.path).query).get("directory") or [None])[0]
         drop_after = int(os.environ.get("FAKE_OPENCODE_EVENT_DROP", 0))
         silent = bool(os.environ.get("FAKE_OPENCODE_EVENT_SILENT"))
         self.close_connection = True
@@ -505,8 +643,7 @@ class Handler(BaseHTTPRequestHandler):
         sent = 0
         deadline = time.time() + 120
         try:
-            self._write_event({"id": "evt_hello", "type": "server.connected",
-                               "properties": {}})
+            self._write_event({"id": "evt_hello", "type": "server.connected", "properties": {}})
             with LOCK:
                 held = STATE["on_drop"]
                 STATE["on_drop"] = None
@@ -517,7 +654,7 @@ class Handler(BaseHTTPRequestHandler):
                 # stream connected is never replayed, so the drop would never
                 # come and the reply would never land.
                 threading.Timer(0.5, lambda: _locked_complete(*held)).start()
-                return
+                return None
             while time.time() < deadline:
                 if silent:
                     time.sleep(0.05)
@@ -531,12 +668,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._write_event(entry["event"])
                     sent += 1
                     if drop_after and sent >= drop_after:
-                        return
+                        return None
                 time.sleep(0.02)
         except (BrokenPipeError, ConnectionResetError, OSError):
-            return
+            return None
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         log_request("GET", path, None)
         if path == "/event":
@@ -544,11 +681,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._event_stream()
         with LOCK:
             if path == "/session/status":
-                busy = {}
+                busy: dict[str, Json] = {}
                 for sid, session in STATE["sessions"].items():
                     for message in session["messages"]:
                         info = message["info"]
-                        if info.get("role") == "assistant" and info["time"].get("completed") is None:
+                        stamps = as_dict(info.get("time"))
+                        if info.get("role") == "assistant" and stamps.get("completed") is None:
                             busy[sid] = {"type": "busy"}
                 return self._send(200, busy)
             if path == "/config":
@@ -556,11 +694,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/config/providers":
                 return self._send(200, script().get("providers", DEFAULT_PROVIDERS))
             if path == "/permission":
-                return self._send(200, [self._public(g) for g in STATE["gates"]
-                                        if g.get("_kind", "permission") == "permission"])
+                return self._send(
+                    200,
+                    [
+                        self._public(g)
+                        for g in STATE["gates"]
+                        if g.get("_kind", "permission") == "permission"
+                    ],
+                )
             if path == "/question":
-                return self._send(200, [self._public(g) for g in STATE["gates"]
-                                        if g.get("_kind") == "question"])
+                return self._send(
+                    200, [self._public(g) for g in STATE["gates"] if g.get("_kind") == "question"]
+                )
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "session" and parts[2] == "message":
                 if flaky_read():
@@ -572,10 +717,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     @staticmethod
-    def _public(gate: dict) -> dict:
+    def _public(gate: Json) -> Json:
         return {k: v for k, v in gate.items() if k != "_kind"}
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         body = self._read_body()
         log_request("POST", path, body)
@@ -586,14 +731,14 @@ class Handler(BaseHTTPRequestHandler):
                 if bad:
                     return self._send(400, {"error": bad})
                 sid = next_id("ses")
-                request = body if isinstance(body, dict) else {}
+                request = as_dict(body)
                 STATE["sessions"][sid] = {
                     "permission": request.get("permission"),
                     # From the query string, which is where the driver and the
                     # real API both carry it — not from the body.
-                    "directory": parse_qs(urlparse(self.path).query).get(
-                        "directory", [None]
-                    )[0],
+                    "directory": (parse_qs(urlparse(self.path).query).get("directory") or [None])[
+                        0
+                    ],
                     "messages": [],
                 }
                 return self._send(200, {"id": sid, "permission": request.get("permission")})
@@ -604,11 +749,11 @@ class Handler(BaseHTTPRequestHandler):
                 bad = model_shape_error("prompt_async", body)
                 if bad:
                     return self._send(400, {"error": bad})
-                request = body if isinstance(body, dict) else {}
+                request = as_dict(body)
                 start_turn(sid, str(request.get("messageID")))
                 return self._send(204, None)
             if len(parts) == 4 and parts[0] == "session" and parts[2] == "permissions":
-                request = body if isinstance(body, dict) else {}
+                request = as_dict(body)
                 clear_gate(parts[3], str(request.get("response", "once")))
                 return self._send(200, True)
             if len(parts) == 3 and parts[0] == "question" and parts[2] == "reply":
